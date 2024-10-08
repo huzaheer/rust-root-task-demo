@@ -1,88 +1,176 @@
-//
-// Copyright 2023, Colias Group, LLC
-//
-// SPDX-License-Identifier: BSD-2-Clause
-//
-
 #![no_std]
 #![no_main]
 
+// Same initialization as example
+extern crate alloc;
+
+use core::ptr;
+use object::{File, Object};
 use sel4_root_task::{root_task, Never};
 
-#[root_task]
+mod child_vspace;
+mod object_allocator;
+
+use child_vspace::create_child_vspace;
+use object_allocator::ObjectAllocator;
+
+// Same initialization as example, loading children from executable and linkable binary file
+const CHILD1_ELF_CONTENTS: &[u8] = include_bytes!(env!("CHILD1_ELF"));
+const CHILD2_ELF_CONTENTS: &[u8] = include_bytes!(env!("CHILD2_ELF")); // <-- where this?
+
+#[root_task(heap_size = 1024 * 64)]
 fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
-    sel4::debug_println!("Hello, World!");
+    sel4::debug_println!("In root task");
 
+    // Allocates Kernel Objects (e.g TCB, frames etc.)
+    let mut object_allocator = ObjectAllocator::new(bootinfo);
 
-    // Create Notification Object
-    let blueprint = sel4::ObjectBlueprint::Notification;
+    // Gives free address page for process to use
+    let free_page_addr1 = init_free_page_addr(bootinfo);
+    let free_page_addr2 = init_free_page_addr(bootinfo);
 
-    /* Untyped memory is a block of contiguous physical memory with a specific size. 
-    Untyped capabilities are capabilities to untyped memory. 
-    Untyped capabilities can be retyped into kernel objects together 
-    with capabilities to them, or into further, usually smaller, untyped capabilities. */
+    // Parses the ELF files
+    let client_image = File::parse(CHILD1_ELF_CONTENTS).unwrap();
+    let server_image = File::parse(CHILD2_ELF_CONTENTS).unwrap();
 
+    // Assigns a virtual address space to the child, 
+    let (child1_vspace, ipc_buffer_addr1, ipc_buffer_cap1) = create_child_vspace(
+        &mut object_allocator,
+        &client_image,
+        sel4::init_thread::slot::VSPACE.cap(),
+        free_page_addr1,
+        sel4::init_thread::slot::ASID_POOL.cap(),
+    );
 
-    // Iterate through untyped memory and find large enough free size and store it
-    let chosen_untyped_ix = bootinfo
-        .untyped_list()
-        .iter()
-        .position(|desc| !desc.is_device() && desc.size_bits() >= blueprint.physical_size_bits())
+    /*Assigns a virtual address space to the child, gets ipc_buffer address to allow 
+    both processes to communicate and ipc_buffer_cap for capability */ 
+    let (child2_vspace, ipc_buffer_addr2, ipc_buffer_cap2) = create_child_vspace(
+        &mut object_allocator,
+        &server_image,
+        sel4::init_thread::slot::VSPACE.cap(),
+        free_page_addr2,
+        sel4::init_thread::slot::ASID_POOL.cap(),
+    );
+
+    // Creates a notification capability for the root process
+    let client_to_server_nfn = object_allocator.allocate_fixed_sized::<sel4::cap_type::Notification>();
+
+    // Set number of bits to allocate to Cnode of each process
+    let child_cnode_size_bits = 2;
+
+    // Allocate Cnode space and mint a capabilty at address space 2 for a notification capability with write only rights
+    let client_cnode = object_allocator.allocate_variable_sized::<sel4::cap_type::CNode>(child_cnode_size_bits);
+    client_cnode
+        .relative_bits_with_depth(1, child_cnode_size_bits) // figure this out
+        .mint(
+            &sel4::init_thread::slot::CNODE
+                .cap()
+                .relative(client_to_server_nfn),
+            sel4::CapRights::write_only(),
+            0,
+        )
         .unwrap();
 
-    // Retrieve capability for that memory slot
-    let untyped = bootinfo.untyped().index(chosen_untyped_ix).cap();
+    // Allocate Cnode space and mint a capabilty at address space 2 for a notification capability with write only rights
+    let server_cnode = object_allocator.allocate_variable_sized::<sel4::cap_type::CNode>(child_cnode_size_bits);
+    server_cnode
+        .relative_bits_with_depth(1, child_cnode_size_bits) // does this need to change (also allocating to same space?)
+        .mint(
+            &sel4::init_thread::slot::CNODE
+                .cap()
+                .relative(child1_to_child2_nfn),
+            sel4::CapRights::read_only(),
+            0,
+        )
+        .unwrap();
 
-    // Find empty capability clots in the Cnode, then store in unbadged 
-    // and baged notification slot to be assigned later
-    let mut empty_slots = bootinfo
-        .empty()
-        .range()
-        .map(sel4::init_thread::Slot::from_index);
-    let unbadged_notification_slot = empty_slots.next().unwrap();
-    let badged_notification_slot = empty_slots.next().unwrap();
+    // Creating a thread capability
+    let client_tcb = object_allocator.allocate_fixed_sized::<sel4::cap_type::Tcb>();
+    client_tcb
+        .tcb_configure(
+            sel4::init_thread::slot::NULL.cptr(),
+            child1_cnode,
+            sel4::CNodeCapData::new(0, sel4::WORD_SIZE - child_cnode_size_bits),
+            child1_vspace,
+            ipc_buffer_addr1 as sel4::Word,
+            ipc_buffer_cap1,
+        )
+        .unwrap();
 
-    /* Retype the untyped capability into Notification object type in context of the 
-    the current threads CNODE, use slot assigned to unbadged_notification */ 
-    let cnode = sel4::init_thread::slot::CNODE.cap();
+    // Creating a thread capability
+    let server_tcb = object_allocator.allocate_fixed_sized::<sel4::cap_type::Tcb>();
+    server_tcb
+        .tcb_configure(
+            sel4::init_thread::slot::NULL.cptr(),
+            child2_cnode,
+            sel4::CNodeCapData::new(0, sel4::WORD_SIZE - child_cnode_size_bits),
+            child2_vspace,
+            ipc_buffer_addr2 as sel4::Word,
+            ipc_buffer_cap2,
+        )
+        .unwrap();
 
-    untyped.untyped_retype(
-        &blueprint,
-        &cnode.relative_self(),
-        unbadged_notification_slot.index(),
-        1,
-    )?;
+    // Giving child process full access to its TCB capability 
+    client_cnode
+        .relative_bits_with_depth(2, child_cnode_size_bits)
+        .mint(
+            &sel4::init_thread::slot::CNODE.cap().relative(child1_tcb),
+            sel4::CapRights::all(),
+            0,
+        )
+        .unwrap();
 
+    // Giving child process full access to its TCB capability
+    server_cnode
+        .relative_bits_with_depth(2, child_cnode_size_bits)
+        .mint(
+            &sel4::init_thread::slot::CNODE.cap().relative(child2_tcb),
+            sel4::CapRights::all(),
+            0,
+        )
+        .unwrap();
 
-    /*Derive another capability from the original unbaged notification capability s
-    uch that the new capability only have write_only rights*/
-    let badge = 0x1337;
+    // Set up and launch both child processes
+    let mut ctx1 = sel4::UserContext::default();
+    *ctx1.pc_mut() = client_image.entry().try_into().unwrap();
+    client_tcb.tcb_write_all_registers(true, &mut ctx1).unwrap();
 
-    cnode.relative(badged_notification_slot.cptr()).mint(
-        &cnode.relative(unbadged_notification_slot.cptr()),
-        sel4::CapRights::write_only(),
-        badge,
-    )?;
+    let mut ctx2 = sel4::UserContext::default();
+    *ctx2.pc_mut() = server_image.entry().try_into().unwrap();
+    server_tcb.tcb_write_all_registers(true, &mut ctx2).unwrap();
 
-    /*Finally, retrieve capabilites and make the badged notification signal,
-    make the unbadged notification wait*/
-
-    let unbadged_notification = unbadged_notification_slot
-        .downcast::<sel4::cap_type::Notification>()
-        .cap();
-    let badged_notification = badged_notification_slot
-        .downcast::<sel4::cap_type::Notification>()
-        .cap();
-
-    badged_notification.signal();
-
-    let (_, observed_badge) = unbadged_notification.wait();
-
-    //Check if observed badge is same as sent badge, if yes then task was success, quit!
-    sel4::debug_println!("badge = {:#x}", badge);
-    assert_eq!(observed_badge, badge);
-
-    sel4::debug_println!("TEST_PASS");
+    sel4::debug_println!("Server and Client talk to each other (Inshallah)!");
 
     sel4::init_thread::suspend_self()
 }
+
+// // //
+
+#[repr(C, align(4096))]
+struct FreePagePlaceHolder(#[allow(dead_code)] [u8; GRANULE_SIZE]);
+
+static mut FREE_PAGE_PLACEHOLDER: FreePagePlaceHolder = FreePagePlaceHolder([0; GRANULE_SIZE]);
+
+fn init_free_page_addr(bootinfo: &sel4::BootInfo) -> usize {
+    let addr = ptr::addr_of!(FREE_PAGE_PLACEHOLDER) as usize;
+    get_user_image_frame_slot(bootinfo, addr)
+        .cap()
+        .frame_unmap()
+        .unwrap();
+    addr
+}
+
+fn get_user_image_frame_slot(
+    bootinfo: &sel4::BootInfo,
+    addr: usize,
+) -> sel4::init_thread::Slot<sel4::cap_type::Granule> {
+    extern "C" {
+        static __executable_start: usize;
+    }
+    let user_image_addr = ptr::addr_of!(__executable_start) as usize;
+    bootinfo
+        .user_image_frames()
+        .index(addr / GRANULE_SIZE - user_image_addr / GRANULE_SIZE)
+}
+
+const GRANULE_SIZE: usize = sel4::FrameObjectType::GRANULE.bytes();
